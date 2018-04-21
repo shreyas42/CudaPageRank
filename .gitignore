@@ -4,3 +4,7 @@
 *.ptx
 *.cubin
 *.fatbin
+*.o
+edges
+web-Google.txt
+temp.txt
