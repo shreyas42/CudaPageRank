@@ -396,26 +396,7 @@ int main(int argc,char **argv){
     create_map();
     init_ranks();
     init_transitions();
-/*
-    printf("Edges\n");
-    for(int i=0;i<edges_length;i++){
-        printf("%ld\n",edges[i]);
-    }
-    
-    printf("Transitions\n");
-    for(int i=0;i<edges_length;i++){
-        printf("%ld %f\n",transitions[i].edge,transitions[i].val);
-    }
-    
-    printf("Vertices\n");
-    for(int i=0;i<vertex_length;i++){
-        printf("NUmber: %ld\tStart: %ld\tN: %d\n",vertex_list[i].number,vertex_list[i].start,vertex_list[i].n);
-    }
-    printf("Initial ranks\n");
-    for(int i=0;i<vertex_length;i++){
-        printf("%f\n",ranks[i]);
-    }
-*/
+
     //initializing device memory
     g_type *d_elength;
     check_error(cudaMalloc((void **)&d_elength,sizeof(g_type)));
