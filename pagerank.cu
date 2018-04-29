@@ -51,6 +51,7 @@ g_type vertex_itr;
 struct entry *transitions;
 struct map *node_map;
 double *ranks;
+double *result;
 
 //end of struct and global definitions
 
@@ -340,22 +341,73 @@ void delete_transitions(){
     if(transitions != NULL)
         free(transitions);
 }
+
+void init_result(){
+    if(vertex_list == NULL){
+        fprintf(stderr,"Null pointer error in %s at line %d\n",__FILE__,__LINE__);
+        return ;
+    }
+    if(edges == NULL){
+        fprintf(stderr,"Null pointer error in %s at line %d\n",__FILE__,__LINE__);
+        return ;
+    }
+    if(result == NULL){
+        result = (double *)malloc(vertex_length * sizeof(double));
+        if(result == NULL){
+            fprintf(stderr,"Malloc failed in %s at line %d\n",__FILE__,__LINE__);
+            return ;
+        }
+    }
+    for(int i=0;i<vertex_length;i++){
+        result[i] = 0.0;
+    }
+}
+
+void delete_result(){
+    if(result != NULL)
+        free(result);
+}
+
+int pagerank(){
+    for(int i=0;i<vertex_length;i++){
+        for(int j = vertex_list[i].start; j < vertex_list[i].start + vertex_list[i].n; j++){
+            double temp = transitions[j].val * ranks[i];
+            g_type index = search_map(transitions[j].edge);
+            result[index] += temp;
+        }
+    }
+    return 1;
+}
+
+void update_ranks(){
+    for(int i=0;i<vertex_length;i++){
+        ranks[i] = result[i];
+        result[i] = 0.0;
+    }
+}
+
 //end of interface
 
 //CUDA kernels
-__global__ void multiply_kernel(struct vertex *d_vertices,struct entry *d_transitions,double *d_ranks,double *d_res,g_type *d_vlength){
+__global__ void multiply_kernel(struct vertex *d_vertices,struct entry *d_transitions,struct map *d_map,double *d_ranks,double *d_tempranks,g_type *d_vlength){
    int threadId = blockDim.x * blockIdx.x + threadIdx.x;
    double b = d_ranks[threadId];
    g_type len = *d_vlength;
    if(threadId < len){
        for(g_type i = d_vertices[threadId].start;i < d_vertices[threadId].start + d_vertices[threadId].n;i++){
            double a = d_transitions[i].val;
+           int index = search_dmap(d_map,d_vlength,d_transitions[i].edge);
            double res = a * b;
-           d_res[i] = res; 
+           double temp = d_tempranks[index];
+            __syncthreads();
+            temp += res;
+            d_tempranks[index] = temp;
+            __syncthreads(); 
        }
    }
 }
 
+//deprecated
 __global__ void add_kernel(struct vertex *d_vertices,struct entry *d_transitions,double *d_res,struct map *d_map,double *d_tempranks,g_type *d_vlength){
     int threadId = blockDim.x * blockIdx.x + threadIdx.x;
     g_type len = *d_vlength;
@@ -384,96 +436,126 @@ __global__ void update_kernel(double *d_tempranks,double *d_ranks,g_type *d_vlen
 
 //main program begins here
 int main(int argc,char **argv){
-    if(argc != 3){
-        fprintf(stderr,"Correct usage: %s <pathToGraph> <numIterations>\n",argv[0]);
+    if(argc != 4){
+        fprintf(stderr,"Correct usage: %s <pathToGraph> <numIterations> <serial = 0/parallel = 1>\n",argv[0]);
         exit(1);
     }
     FILE *fp = fopen(argv[1],"r");
     const int iterations = atoi(argv[2]);
+    const int mode = atoi(argv[3]);
     init_vertices();
     init_edges();
     build_graph(fp);
     create_map();
     init_ranks();
     init_transitions();
+    if(mode == 1){
+        //initializing device memory
+        g_type *d_elength;
+        check_error(cudaMalloc((void **)&d_elength,sizeof(g_type)));
+        check_error(cudaMemcpy(d_elength,&edges_length,sizeof(g_type),cudaMemcpyHostToDevice));
 
-    //initializing device memory
-    g_type *d_elength;
-    check_error(cudaMalloc((void **)&d_elength,sizeof(g_type)));
-    check_error(cudaMemcpy(d_elength,&edges_length,sizeof(g_type),cudaMemcpyHostToDevice));
+        g_type *d_vlength;
+        check_error(cudaMalloc((void **)&d_vlength,sizeof(g_type)));
+        check_error(cudaMemcpy(d_vlength,&vertex_length,sizeof(g_type),cudaMemcpyHostToDevice));
 
-    g_type *d_vlength;
-    check_error(cudaMalloc((void **)&d_vlength,sizeof(g_type)));
-    check_error(cudaMemcpy(d_vlength,&vertex_length,sizeof(g_type),cudaMemcpyHostToDevice));
+        struct vertex *d_vertices;
+        check_error(cudaMalloc((void **)&d_vertices,vertex_length * sizeof(struct vertex)));
+        check_error(cudaMemcpy(d_vertices,vertex_list,vertex_length * sizeof(struct vertex),cudaMemcpyHostToDevice));
 
-    struct vertex *d_vertices;
-    check_error(cudaMalloc((void **)&d_vertices,vertex_length * sizeof(struct vertex)));
-    check_error(cudaMemcpy(d_vertices,vertex_list,vertex_length * sizeof(struct vertex),cudaMemcpyHostToDevice));
+        struct entry *d_transitions;
+        check_error(cudaMalloc((void **)&d_transitions,edges_length * sizeof(struct entry)));
+        check_error(cudaMemcpy(d_transitions,transitions,edges_length * sizeof(struct entry),cudaMemcpyHostToDevice));
 
-    struct entry *d_transitions;
-    check_error(cudaMalloc((void **)&d_transitions,edges_length * sizeof(struct entry)));
-    check_error(cudaMemcpy(d_transitions,transitions,edges_length * sizeof(struct entry),cudaMemcpyHostToDevice));
+        struct map *d_map;
+        check_error(cudaMalloc((void **)&d_map,vertex_length * sizeof(struct map)));
+        check_error(cudaMemcpy(d_map,node_map,vertex_length * sizeof(struct map),cudaMemcpyHostToDevice));
 
-    struct map *d_map;
-    check_error(cudaMalloc((void **)&d_map,vertex_length * sizeof(struct map)));
-    check_error(cudaMemcpy(d_map,node_map,vertex_length * sizeof(struct map),cudaMemcpyHostToDevice));
+        double *d_ranks;
+        check_error(cudaMalloc((void **)&d_ranks,vertex_length * sizeof(double)));
+        check_error(cudaMemcpy(d_ranks,ranks,vertex_length * sizeof(double),cudaMemcpyHostToDevice));
 
-    double *d_ranks;
-    check_error(cudaMalloc((void **)&d_ranks,vertex_length * sizeof(double)));
-    check_error(cudaMemcpy(d_ranks,ranks,vertex_length * sizeof(double),cudaMemcpyHostToDevice));
+        double *d_res;
+        check_error(cudaMalloc((void **)&d_res,edges_length * sizeof(double)));
 
-    double *d_res;
-    check_error(cudaMalloc((void **)&d_res,edges_length * sizeof(double)));
+        double *d_tempranks;
+        check_error(cudaMalloc((void **)&d_tempranks,vertex_length * sizeof(double)));
 
-    double *d_tempranks;
-    check_error(cudaMalloc((void **)&d_tempranks,vertex_length * sizeof(double)));
+        //pagerank iterations begin here: Power method
 
-    //pagerank iterations begin here: Power method
-
-    int blocks = 1;
-    int threads = vertex_length;
-    if(vertex_length > MAX_THREADS_PER_BLOCK){
-        blocks = (int)ceil(vertex_length / (double)MAX_THREADS_PER_BLOCK);
-        threads = MAX_THREADS_PER_BLOCK;
-    }
-    
-    int counter = 0;
-    while(counter < iterations){
-        check_error(cudaMemset(d_res,0.0,edges_length * sizeof(double)));
-        check_error(cudaMemset(d_tempranks,0.0,vertex_length * sizeof(double)));
+        int blocks = 1;
+        int threads = vertex_length;
+        if(vertex_length > MAX_THREADS_PER_BLOCK){
+            blocks = (int)ceil(vertex_length / (double)MAX_THREADS_PER_BLOCK);
+            threads = MAX_THREADS_PER_BLOCK;
+        }
         
-        multiply_kernel<<<blocks,threads>>>(d_vertices,d_transitions,d_ranks,d_res,d_vlength);
-        cudaDeviceSynchronize();
-        add_kernel<<<blocks,threads>>>(d_vertices,d_transitions,d_res,d_map,d_tempranks,d_vlength); 
-        cudaDeviceSynchronize();
-        update_kernel<<<blocks,threads>>>(d_tempranks,d_ranks,d_vlength);
-        counter++;
-    }
-    //end of pagerank iterations
+        int counter = 0;
+        clock_t begin = clock();
+        while(counter < iterations){
 
-    double *res;
-    res = (double *)malloc(vertex_length * sizeof(double));
-    check_error(cudaMemcpy(res,d_ranks,vertex_length * sizeof(double),cudaMemcpyDeviceToHost));
-    for(int i = 0;i<vertex_length;i++){
-        printf("%lf\n",res[i]);
-    }
-    free(res);
 
+            check_error(cudaMemset(d_res,0.0,edges_length * sizeof(double)));
+            check_error(cudaMemset(d_tempranks,0.0,vertex_length * sizeof(double)));
+            
+            multiply_kernel<<<blocks,threads>>>(d_vertices,d_transitions,d_map,d_ranks,d_tempranks,d_vlength);
+            cudaDeviceSynchronize();
+            //add_kernel<<<blocks,threads>>>(d_vertices,d_transitions,d_res,d_map,d_tempranks,d_vlength); 
+            //cudaDeviceSynchronize();
+            update_kernel<<<blocks,threads>>>(d_tempranks,d_ranks,d_vlength);
+            cudaDeviceSynchronize();
+            counter++;
+        }
+        clock_t end = clock();
+        //end of pagerank iterations
+
+        double time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+        double *res;
+        res = (double *)malloc(vertex_length * sizeof(double));
+        check_error(cudaMemcpy(res,d_ranks,vertex_length * sizeof(double),cudaMemcpyDeviceToHost));
+        for(int i = 0;i<vertex_length;i++){
+            printf("%lf\n",res[i]);
+        }
+        free(res);
+        printf("%lf s\n",time_spent);
+
+        check_error(cudaFree(d_elength));
+        check_error(cudaFree(d_vlength));
+        check_error(cudaFree(d_vertices));
+        check_error(cudaFree(d_transitions));
+        check_error(cudaFree(d_map));
+        check_error(cudaFree(d_ranks));
+        check_error(cudaFree(d_res));
+        check_error(cudaFree(d_tempranks));
+    }
+    else{
+        clock_t begin = clock();
+        init_result();
+        int counter = 0;
+        while(counter < iterations){
+            if(!pagerank()){
+                fprintf(stderr,"Pagerank failed in iteration: %d\n",counter);
+                break;
+            }
+            update_ranks();
+            counter++;
+        }
+        clock_t end = clock();
+        double time_spent = (double)(end - begin) / CLOCKS_PER_SEC;
+        for(int i = 0;i<vertex_length;i++){
+            printf("%lf\n",ranks[i]);
+        }
+        printf("%lf s\n",time_spent);
+    }
     //end of device memory initialization
-    check_error(cudaFree(d_elength));
-    check_error(cudaFree(d_vlength));
-    check_error(cudaFree(d_vertices));
-    check_error(cudaFree(d_transitions));
-    check_error(cudaFree(d_map));
-    check_error(cudaFree(d_ranks));
-    check_error(cudaFree(d_res));
-    check_error(cudaFree(d_tempranks));
     
+
     delete_edges();
     delete_vertices();
     delete_ranks();
     delete_transitions();
     delete_map();
+    delete_result();
     return 0;
 }
 
